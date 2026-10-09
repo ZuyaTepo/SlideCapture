@@ -669,7 +669,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("講義動画 → スライドPDF")
-        self.resize(1280, 800)
+        self.resize(1100, 700)          # 実際の大きさは show_initial() で画面に合わせる
 
         self.reader = None             # VideoReader
         self.video_path = None
@@ -696,7 +696,7 @@ class MainWindow(QMainWindow):
         self.preview = PreviewLabel("「動画を開く」から動画を選択してください")
         self.preview.regions_changed.connect(self._update_region_label)
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(640, 360)
+        self.preview.setMinimumSize(320, 180)
         self.preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.preview.setStyleSheet("background:#202020; color:#bbbbbb;")
 
@@ -775,12 +775,14 @@ class MainWindow(QMainWindow):
         det2.addWidget(self.interval_spin)
         det2.addWidget(QLabel("安定時間"))
         det2.addWidget(self.stable_spin)
-        det2.addSpacing(12)
-        det2.addWidget(QLabel("採用する場面"))
-        det2.addWidget(self.pick_cb)
-        det2.addWidget(QLabel("余裕"))
-        det2.addWidget(self.margin_spin)
         det2.addStretch()
+
+        det3 = QHBoxLayout()
+        det3.addWidget(QLabel("採用する場面"))
+        det3.addWidget(self.pick_cb)
+        det3.addWidget(QLabel("余裕"))
+        det3.addWidget(self.margin_spin)
+        det3.addStretch()
 
         # 除外領域の操作行
         self.region_btn = QPushButton("除外領域を描く")
@@ -805,6 +807,7 @@ class MainWindow(QMainWindow):
         left.addLayout(ctrl)
         left.addLayout(det)
         left.addLayout(det2)
+        left.addLayout(det3)
         left.addLayout(reg)
 
         # 右側：選択済みリスト
@@ -813,7 +816,7 @@ class MainWindow(QMainWindow):
         self.list.setDragDropMode(QAbstractItemView.InternalMove)
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list.itemDoubleClicked.connect(self._jump_to_item)
-        self.list.setMinimumWidth(260)
+        self.list.setMinimumWidth(220)
 
         self.count_label = QLabel("選択済み: 0 枚")
         self.del_btn = QPushButton("選択項目を削除 (Delete)")
@@ -1259,7 +1262,28 @@ class MainWindow(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    # ---------------- ウィンドウの大きさ ----------------
+    def show_initial(self):
+        """前回終了時の位置・大きさ（最大化の状態も含む）で開く。
+        初回や、前回の位置が今の画面に収まらない場合（モニターを外したときなど）は最大化して開く。"""
+        q = QSettings("slide_capture", "slide_capture")
+        geo = q.value("window/geometry")
+        restored = False
+        if geo is not None and self.restoreGeometry(geo):
+            screen = QApplication.screenAt(self.geometry().center())
+            restored = screen is not None and screen.availableGeometry().intersects(self.frameGeometry())
+        if restored:
+            self.show()
+        else:
+            screen = QApplication.primaryScreen()
+            if screen is not None:     # 最大化を解除したときの大きさ（画面の 85%・中央）
+                area = screen.availableGeometry()
+                self.resize(int(area.width() * 0.85), int(area.height() * 0.85))
+                self.move(area.center() - self.rect().center())
+            self.showMaximized()
+
     def closeEvent(self, event):
+        QSettings("slide_capture", "slide_capture").setValue("window/geometry", self.saveGeometry())
         if self.detect_thread is not None:
             self.detect_thread.requestInterruption()
             self.detect_thread.wait()
@@ -1295,7 +1319,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("SlideCapture")
     win = MainWindow()
-    win.show()
+    win.show_initial()
     if len(sys.argv) > 1:          # python slide_capture.py lecture.mp4 でも開ける
         win.load_video(sys.argv[1])
     sys.exit(app.exec())

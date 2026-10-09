@@ -1,5 +1,7 @@
 PySide6>=6.5
-# GUI 表示は PySide6 が担当するので、OpenCV は Qt を含まない headless 版を使う
+# 動画の読み込み（FFmpeg）。時刻で正確に移動できるので、可変フレームレートの動画にも対応できる
+av>=12
+# 画像処理のみに使用。GUI 表示は PySide6 が担当するので、Qt を含まない headless 版を使う
 # （通常版の opencv-python は Linux で PySide6 と Qt が衝突することがある）
 opencv-python-headless>=4.8
 pymupdf>=1.24

@@ -3,17 +3,18 @@
 
 必要なライブラリ:
     pip install -r requirements.txt
-    （PySide6, opencv-python-headless, pymupdf, numpy）
+    （PySide6, av, opencv-python-headless, pymupdf, numpy）
 
 exe化:
     Windows ならフォルダ内の build.bat をダブルクリック（詳しくは README.md）
 
 使い方:
     python slide_capture.py
-    1. 「動画を開く」で動画を選ぶ
+    1. 「動画を開く」で動画を選ぶ（動画ファイルをウィンドウにドラッグ＆ドロップしてもよい）
     2. 「自動検出」でスライドの切り替わりを検出し、候補を一覧に追加する（任意）
     3. シークバーや矢印キーで場面を探し、「このフレームを追加」（Enter / Space）で手動追加
     4. 一覧はドラッグで並び替え、Deleteキーで削除、ダブルクリックでその時刻へ移動
+       候補の場面がずれていたら、ダブルクリック → 矢印キーで調整 → R キーで置き換え
     5. 「PDF保存」で一覧の順にPDFへ書き出す（ページサイズ・解像度・画質を選べる）
     ※ 顔出し映像などで誤検出する場合は、検出前に「除外領域」を指定する
 
@@ -23,6 +24,7 @@ exe化:
     , / .           : 1フレーム戻る / 進む
     Enter / Space   : 現在のフレームを追加
     Delete          : 一覧で選択中の項目を削除
+    R               : 一覧で選択中の項目を、表示中のフレームで置き換え
     Esc             : 除外領域の描画モードを終了
 
 除外領域:
@@ -36,22 +38,29 @@ exe化:
     一定間隔でフレームを縮小し、文字や図の輪郭（エッジ）を取り出す。
     前後のフレームでエッジがほとんど変わらなければ「安定」とみなす。
     安定した画面どうしを比べて、前の画面のエッジが「感度」以上の割合で
-    消えていたらスライドの切り替わりとみなし、切り替わる直前の安定した
-    画面を候補にする。
-    そのため、箇条書きが順に表示されるスライドでは、全項目が出そろった状態が
-    候補になる。切り替え時のフェードやアニメーション中の画面は候補にならない。
+    消えていたらスライドの切り替わりとみなす。
+    フレーム番号ではなく動画内の時刻で判定するので、Zoom の録画などの
+    可変フレームレート（VFR）動画でも時間がずれない。
+    「採用する場面」で、どの場面を候補にするかを選べる。
+      ・次の切り替わりの直前：スライドの最後の状態（箇条書きが全部出そろった状態）
+      ・切り替わりの直後　　：スライドが表示された最初の状態
+    「余裕」の秒数だけ切り替わりの瞬間から離れた場面を選ぶので、
+    候補の画像と、ダブルクリックで移動した先の画面が食い違いにくい。
+    切り替え時のフェードやアニメーション中の画面は候補にならない。
 """
 
 import math
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
+import av  # PyAV（FFmpeg）：動画の読み込み
 import cv2
 import numpy as np
 import pymupdf  # PyMuPDF
 from PySide6.QtCore import (
-    Qt, QTimer, QSize, QThread, Signal, QRectF, QPointF, QSettings,
+    Qt, QTimer, QSize, QThread, Signal, QRectF, QPointF, QSettings, QEvent,
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QIcon, QKeySequence, QShortcut, QPainter, QPen, QColor,
@@ -78,6 +87,104 @@ def bgr_to_qimage(frame) -> QImage:
 
 
 # ============================================================
+# 動画の読み込み（GUIに依存しない部分）
+# ============================================================
+def _stream_info(container, stream):
+    """(開始時刻, 長さ[秒], 平均fps) を返す"""
+    tb = stream.time_base
+    start = float(stream.start_time * tb) if stream.start_time is not None else 0.0
+    fps = float(stream.average_rate or stream.guessed_rate or 30)
+    if stream.duration:
+        duration = float(stream.duration * tb)
+    elif container.duration:
+        duration = container.duration / av.time_base
+    elif stream.frames:
+        duration = stream.frames / fps
+    else:
+        duration = 0.0
+    return start, duration, fps
+
+
+class VideoReader:
+    """時刻を指定して、その時刻に表示されているフレームを取り出す。
+    フレームの時刻（タイムスタンプ）で位置を決めるので、Zoom の録画などの
+    可変フレームレート（VFR）動画でも正確に移動できる。"""
+
+    EPS = 0.0015   # シークバー（ミリ秒単位）の丸め誤差を吸収する
+
+    def __init__(self, path):
+        self.container = av.open(str(path))
+        self.stream = self.container.streams.video[0]
+        self.stream.thread_type = "AUTO"
+        self.tb = self.stream.time_base
+        self.start, self.duration, self.fps = _stream_info(self.container, self.stream)
+        self._probe_end()
+        self._gen = None
+        self._last = None    # 最後に返したフレーム
+        self._peek = None    # その次のフレーム（先読み）
+
+    def close(self):
+        self.container.close()
+
+    def _probe_end(self):
+        """ファイルに記録された長さが、最後のフレームより短い動画がある。
+        末尾を実際に読んで、最後のフレームまでシークバーで行けるようにする。"""
+        try:
+            self.container.seek(int((self.start + self.duration + 10) / self.tb),
+                                stream=self.stream, backward=True, any_frame=False)
+            last = None
+            for f in self.container.decode(self.stream):
+                if f.time is not None:
+                    last = f.time
+            if last is not None:
+                self.duration = max(self.duration, last - self.start + 1.0 / self.fps)
+        except Exception:  # noqa: BLE001  長さの補正は、できなくても動作に支障はない
+            pass
+
+    def _next(self):
+        if self._peek is not None:
+            f, self._peek = self._peek, None
+            return f
+        for f in self._gen:
+            if f.time is not None:
+                return f
+        return None
+
+    def _seek(self, target):
+        self.container.seek(max(0, int(target / self.tb)), stream=self.stream,
+                            backward=True, any_frame=False)
+        self._gen = self.container.decode(self.stream)
+        self._last = self._peek = None
+
+    def frame_at(self, t: float):
+        """時刻 t[秒] に表示されているフレームを (そのフレームの時刻[秒], BGR画像) で返す"""
+        target = t + self.start
+        last = self._last
+        # 少し先へ進むだけなら、シークせずに読み進める（矢印キー操作が速くなる）
+        if not (last is not None and last.time <= target + self.EPS and target - last.time < 2.0):
+            self._seek(target)
+        while True:
+            f = self._next()
+            if f is None:
+                break
+            if f.time > target + self.EPS and self._last is not None:
+                self._peek = f
+                break
+            self._last = f
+        if self._last is None:
+            return None
+        return self._last.time - self.start, self._last.to_ndarray(format="bgr24")
+
+    def next_time(self):
+        """直前に返したフレームの、次のフレームの時刻[秒]（なければ None）"""
+        if self._last is None:
+            return None
+        if self._peek is None:
+            self._peek = self._next()
+        return None if self._peek is None else self._peek.time - self.start
+
+
+# ============================================================
 # スライド切り替わり検出（GUIに依存しない部分）
 # ============================================================
 @dataclass
@@ -86,6 +193,8 @@ class DetectParams:
     interval_sec: float = 0.5    # 何秒ごとにフレームを調べるか
     stable_sec: float = 1.0      # この時間、画面が変化しなければ「安定」とみなす
     exclude: tuple = ()          # 除外領域 ((x0, y0, x1, y1), ...) 画面に対する割合 0〜1
+    pick: str = "before"         # "before"：次の切り替わりの直前 / "after"：切り替わりの直後
+    margin_sec: float = 1.0      # 切り替わりの瞬間から、この秒数だけ離れた場面を選ぶ
 
 
 _KERNEL = np.ones((3, 3), np.uint8)
@@ -127,76 +236,146 @@ def _lost(a, b) -> float:
     return float(np.count_nonzero(ea & ~db)) / na
 
 
+class _Run:
+    """前後のフレームでほとんど変化がない、ひと続きの区間"""
+
+    def __init__(self, t, frame, e, margin):
+        self.start = t
+        self.edges = e                      # 最新のエッジ
+        self.margin = margin
+        self.samples = deque([(t, frame)])  # 終わり側の余裕分だけ保持（メモリ節約）
+        self.head = (t, frame)              # 開始から margin 秒後の時点で表示されている画面
+
+    def add(self, t, frame, e):
+        self.edges = e
+        self.samples.append((t, frame))
+        if t <= self.start + self.margin:
+            self.head = (t, frame)
+        while len(self.samples) >= 2 and self.samples[1][0] <= t - self.margin:
+            self.samples.popleft()
+
+    def _shown_at(self, x):
+        """時刻 x に表示されている画面（x 以前で最も新しいフレーム）"""
+        ok = [smp for smp in self.samples if smp[0] <= x + 1e-9]
+        return max(ok, key=lambda smp: smp[0]) if ok else self.samples[0]
+
+    def pick(self, end, mode):
+        """候補にする (時刻, 画面)。時刻は切り替わりの瞬間から margin 秒離す。
+        区間が短すぎて両側に margin 秒取れないときは、区間の真ん中にする。
+        VFR動画では指定の時刻ちょうどのフレームがないことがあるので、
+        「その時刻に表示されているフレーム」を返す。"""
+        if end - self.start < 2 * self.margin:
+            x = (self.start + end) / 2
+            return x, self._shown_at(x)[1]
+        if mode == "after":
+            return self.start + self.margin, self.head[1]
+        x = end - self.margin
+        return x, self._shown_at(x)[1]
+
+
 def detect_slides(path, params: DetectParams, should_stop=lambda: False,
                   on_progress=lambda pct: None):
-    """スライド候補を (フレーム番号, 元解像度フレーム) で順に yield する。"""
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise RuntimeError("動画を開けませんでした")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-    step = max(1, round(params.interval_sec * fps))
-    need_stable = max(1, math.ceil(params.stable_sec / params.interval_sec))
+    """スライド候補を (動画内の時刻[秒], 元解像度フレーム) で順に yield する。"""
+    try:
+        container = av.open(str(path))
+        stream = container.streams.video[0]
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"動画を開けませんでした: {e}") from e
+    stream.thread_type = "AUTO"
+    start, duration, fps = _stream_info(container, stream)
     stable_thr = params.change_ratio / 3   # 「安定」の判定は切り替わり判定より厳しめ
     thr = params.change_ratio
+    margin = max(0.0, params.margin_sec)
     mask = make_exclude_mask(params.exclude)
     if mask is not None and mask.mean() > 0.95:
         raise RuntimeError("除外領域が画面のほぼ全体を覆っています")
 
-    emitted = []          # 候補にしたスライドのエッジ（重複防止用）
-    prev = None
-    stable_run = 0
-    seg = None            # 現在のスライドの最新の安定画面 (edges, full, index)
+    emitted = []      # 候補にしたスライドのエッジ（重複防止用）
+    seg = None        # 現在のスライド {"ref": エッジ, "pick": (時刻, 画面)}
 
-    def flush(s):
-        if s is None:
+    def flush(sg):
+        if sg is None or sg["ref"][2] < _MIN_EDGES:  # 真っ黒・真っ白など無地の画面は除外
             return None
-        e, full, idx = s
-        if e[2] < _MIN_EDGES:                     # 真っ黒・真っ白など無地の画面は除外
-            return None
+        e = sg["ref"]
         for x in emitted:                         # 前に出たスライドに戻っただけなら除外
             if _lost(x, e) < thr and _lost(e, x) < thr:
                 return None
         emitted.append(e)
-        return idx, full
+        return sg["pick"]
 
-    i = 0
+    def close_run(run, end):
+        """区間が終わった。十分長く安定していたら、スライドとして扱う"""
+        nonlocal seg
+        if end - run.start < params.stable_sec:
+            return None                           # フェードやアニメーションの途中
+        if seg is not None and _lost(seg["ref"], run.edges) <= thr:
+            seg["ref"] = run.edges                # 同じスライド（内容が増えただけ）
+            if params.pick == "before":           # 「直前」はスライドの最後の状態を使う
+                seg["pick"] = run.pick(end, "before")
+            return None
+        out = flush(seg)                          # 切り替わり → 前のスライドを確定
+        seg = {"ref": run.edges, "pick": run.pick(end, params.pick)}
+        return out
+
+    run = None
+    last_proc = None
+    last_t = 0.0
     last_pct = -1
+    interval = params.interval_sec - 1e-6
+
+    def handle(t, f):
+        """1枚のフレームを調べる。前のスライドが確定したら (時刻, 画面) を返す"""
+        nonlocal run, last_proc
+        frame = f.to_ndarray(format="bgr24")
+        last_proc = t
+        e = _edges(frame, mask)
+        if run is not None and _lost(run.edges, e) < stable_thr \
+                and _lost(e, run.edges) < stable_thr:
+            run.add(t, frame, e)
+            return None
+        out = close_run(run, t) if run is not None else None
+        run = _Run(t, frame, e, margin)
+        return out
+
+    pending = None    # 1つ前のフレーム。次のフレームの時刻を見てから、調べるか決める
     try:
-        while not should_stop():
-            if not cap.grab():                    # 調べないフレームは grab だけで飛ばす
+        for f in container.decode(stream):
+            if should_stop():
                 break
-            if i % step == 0:
-                ok, frame = cap.retrieve()
-                if not ok:
-                    break
-                e = _edges(frame, mask)
-                if prev is not None and _lost(prev, e) < stable_thr \
-                        and _lost(e, prev) < stable_thr:
-                    stable_run += 1
-                else:
-                    stable_run = 0
-                prev = e
+            if f.time is None:
+                continue
+            t = max(f.time - start, last_t)       # 動画の先頭を 0 秒とした時刻
+            last_t = t
+            if pending is not None:
+                pt, pf = pending
+                # 一定間隔ごとに調べる。ただし、長く表示され続けるフレーム（VFR動画で
+                # 画面が止まっている間のフレーム）は、間隔に関係なく必ず調べる
+                if last_proc is None or pt - last_proc >= interval or t - pt >= interval:
+                    out = handle(pt, pf)
+                    if out:
+                        yield out
+            pending = (t, f)
 
-                if stable_run >= need_stable:
-                    if seg is not None and _lost(seg[0], e) > thr:
-                        out = flush(seg)          # 切り替わり → 直前のスライドを候補に
-                        if out:
-                            yield out
-                    seg = (e, frame, i)           # 同じスライドなら最新の状態に更新
-
-                pct = min(100, i * 100 // total)
+            if duration > 0:
+                pct = min(100, int(t * 100 / duration))
                 if pct != last_pct:
                     last_pct = pct
                     on_progress(pct)
-            i += 1
+        if not should_stop() and pending is not None:
+            out = handle(*pending)                # 最後のフレーム
+            if out:
+                yield out
         if not should_stop():
+            if run is not None:                   # 最後の区間は動画の終わりまで続いたとみなす
+                out = close_run(run, max(duration, last_t + 1.0 / fps))
+                if out:
+                    yield out
             out = flush(seg)                      # 最後のスライド
             if out:
                 yield out
             on_progress(100)
     finally:
-        cap.release()
+        container.close()
 
 
 # ============================================================
@@ -275,7 +454,7 @@ def write_pdf(path, pngs, st: ExportSettings, on_progress=lambda k, n: None):
 
 
 class DetectThread(QThread):
-    found = Signal(int, object)      # フレーム番号, フレーム(BGR)
+    found = Signal(float, object)    # 動画内の時刻[秒], フレーム(BGR)
     progress = Signal(int)
     failed = Signal(str)
 
@@ -286,11 +465,11 @@ class DetectThread(QThread):
 
     def run(self):
         try:
-            for idx, frame in detect_slides(
+            for t, frame in detect_slides(
                     self.path, self.params,
                     should_stop=self.isInterruptionRequested,
                     on_progress=self.progress.emit):
-                self.found.emit(idx, frame)
+                self.found.emit(t, frame)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
 
@@ -482,7 +661,7 @@ class ExportDialog(QDialog):
 
 
 ROLE_ID = Qt.UserRole          # captures 辞書のキー
-ROLE_FRAME = Qt.UserRole + 1   # フレーム番号
+ROLE_TIME = Qt.UserRole + 1    # 動画内の時刻（ミリ秒）
 ROLE_AUTO = Qt.UserRole + 2    # 自動検出による候補か
 
 
@@ -492,12 +671,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("講義動画 → スライドPDF")
         self.resize(1280, 800)
 
-        self.cap = None
+        self.reader = None             # VideoReader
         self.video_path = None
         self.fps = 30.0
-        self.frame_count = 0
+        self.duration_ms = 0
         self.current_frame = None      # 現在表示中のフレーム（BGR, 元解像度）
-        self.current_index = -1        # 現在表示中のフレーム番号
+        self.current_ms = 0            # 現在表示中のフレームの時刻（ミリ秒）
         self.captures = {}             # id -> PNGバイト列（元解像度）
         self.next_id = 0
         self.detect_thread = None
@@ -568,21 +747,40 @@ class MainWindow(QMainWindow):
                                   "何秒ごとにフレームを調べるか")
         self.stable_spin = spin(1.0, 0.2, 10.0, 0.5, " 秒",
                                 "この時間、画面が止まっていたら安定とみなします")
+        self.pick_cb = QComboBox()
+        self.pick_cb.addItem("次の切り替わりの直前", "before")
+        self.pick_cb.addItem("切り替わりの直後", "after")
+        self.pick_cb.setToolTip(
+            "候補にする場面を選びます。\n"
+            "・次の切り替わりの直前：スライドの最後の状態（箇条書きが全部出そろった状態）\n"
+            "・切り替わりの直後：スライドが表示された最初の状態")
+        self.pick_cb.setFocusPolicy(Qt.ClickFocus)
+        self.margin_spin = spin(1.0, 0.0, 10.0, 0.5, " 秒",
+                                "切り替わりの瞬間から、この秒数だけ離れた場面を候補にします。\n"
+                                "候補の画像と、ダブルクリックで移動した先の画面が違う場合は大きくしてください。")
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self._load_detect_settings()
 
         det = QHBoxLayout()
         det.addWidget(self.detect_btn)
         det.addWidget(self.stop_btn)
-        det.addSpacing(12)
-        det.addWidget(QLabel("感度"))
-        det.addWidget(self.ratio_spin)
-        det.addWidget(QLabel("間隔"))
-        det.addWidget(self.interval_spin)
-        det.addWidget(QLabel("安定時間"))
-        det.addWidget(self.stable_spin)
         det.addWidget(self.progress, 1)
+
+        det2 = QHBoxLayout()
+        det2.addWidget(QLabel("感度"))
+        det2.addWidget(self.ratio_spin)
+        det2.addWidget(QLabel("間隔"))
+        det2.addWidget(self.interval_spin)
+        det2.addWidget(QLabel("安定時間"))
+        det2.addWidget(self.stable_spin)
+        det2.addSpacing(12)
+        det2.addWidget(QLabel("採用する場面"))
+        det2.addWidget(self.pick_cb)
+        det2.addWidget(QLabel("余裕"))
+        det2.addWidget(self.margin_spin)
+        det2.addStretch()
 
         # 除外領域の操作行
         self.region_btn = QPushButton("除外領域を描く")
@@ -606,6 +804,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.slider)
         left.addLayout(ctrl)
         left.addLayout(det)
+        left.addLayout(det2)
         left.addLayout(reg)
 
         # 右側：選択済みリスト
@@ -619,12 +818,17 @@ class MainWindow(QMainWindow):
         self.count_label = QLabel("選択済み: 0 枚")
         self.del_btn = QPushButton("選択項目を削除 (Delete)")
         self.del_btn.clicked.connect(self.delete_selected)
+        self.replace_btn = QPushButton("表示中のフレームで置き換え (R)")
+        self.replace_btn.setToolTip("一覧で選択中の項目の画像を、左に表示しているフレームに置き換えます。\n"
+                                    "ダブルクリックで移動 → 矢印キーで調整 → R、の順に使います。")
+        self.replace_btn.clicked.connect(self.replace_selected)
         self.save_btn = QPushButton("PDF保存")
         self.save_btn.clicked.connect(self.save_pdf)
 
         right = QVBoxLayout()
         right.addWidget(self.count_label)
         right.addWidget(self.list, 1)
+        right.addWidget(self.replace_btn)
         right.addWidget(self.del_btn)
         right.addWidget(self.save_btn)
 
@@ -634,6 +838,10 @@ class MainWindow(QMainWindow):
         w = QWidget()
         w.setLayout(root)
         self.setCentralWidget(w)
+
+        # 動画ファイルのドラッグ＆ドロップ（一覧の上に落としても受け付ける）
+        self.setAcceptDrops(True)
+        self.list.viewport().installEventFilter(self)
 
     def _build_shortcuts(self):
         def sc(key, func):
@@ -652,6 +860,7 @@ class MainWindow(QMainWindow):
         sc("Space", self.add_current_frame)
         sc("Delete", self.delete_selected)
         sc("Escape", lambda: self.region_btn.setChecked(False))
+        sc("R", self.replace_selected)
 
     # ---------------- 動画 ----------------
     def open_video(self):
@@ -662,25 +871,46 @@ class MainWindow(QMainWindow):
             self.load_video(path)
 
     def load_video(self, path: str) -> bool:
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
+        if self.detect_thread is not None:
+            QMessageBox.information(self, "動画を開く", "自動検出の実行中は、別の動画を開けません。")
+            return False
+        if self.list.count() > 0:
+            ans = QMessageBox.question(
+                self, "動画を開く",
+                f"一覧に {self.list.count()} 件の項目があります。\n"
+                "クリアしてから新しい動画を開きますか？\n"
+                "（「いいえ」を選ぶと一覧を残したまま開きます）",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            if ans == QMessageBox.Cancel:
+                return False
+            clear_list = ans == QMessageBox.Yes
+        else:
+            clear_list = False
+        try:
+            reader = VideoReader(path)
+            if reader.frame_at(0) is None:
+                raise RuntimeError("フレームを読み込めません")
+        except Exception as e:  # noqa: BLE001
             QMessageBox.warning(
                 self, "エラー",
-                "動画を開けませんでした。\n"
-                "（Windowsでパスに日本語が含まれると開けない場合があります。"
-                "英数字だけのフォルダ・ファイル名で試してください）")
+                f"動画を開けませんでした。\n対応していない形式か、ファイルが壊れている可能性があります。\n\n{e}")
             return False
 
-        if self.cap is not None:
-            self.cap.release()
-        self.cap = cap
+        if self.reader is not None:
+            self.reader.close()
+        if clear_list:
+            self.list.clear()
+            self.captures.clear()
+            self._update_count()
+        self.reader = reader
         self.video_path = Path(path)
-        self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.current_index = -1
+        self.fps = reader.fps
+        self.duration_ms = int(reader.duration * 1000)
 
         self.slider.blockSignals(True)
-        self.slider.setRange(0, max(0, self.frame_count - 1))
+        self.slider.setRange(0, max(0, self.duration_ms))   # シークバーの単位はミリ秒
+        self.slider.setSingleStep(max(1, round(1000 / self.fps)))
+        self.slider.setPageStep(10000)
         self.slider.setValue(0)
         self.slider.blockSignals(False)
         self.slider.setEnabled(True)
@@ -692,28 +922,19 @@ class MainWindow(QMainWindow):
         self.show_frame(0)
         return True
 
-    def read_frame(self, index: int):
-        """指定フレームを読み込む。直後のフレームなら seek せずに読むので速い。"""
-        if self.cap is None:
-            return None
-        index = max(0, min(index, self.frame_count - 1))
-        if index != self.current_index + 1:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, frame = self.cap.read()
-        if not ok:
-            return None
-        self.current_index = index
-        return frame
-
-    def show_frame(self, index: int):
-        frame = self.read_frame(index)
-        if frame is None:
+    def show_frame(self, ms: int):
+        """時刻 ms（ミリ秒）に表示されているフレームを表示する"""
+        if self.reader is None:
             return
+        res = self.reader.frame_at(ms / 1000)
+        if res is None:
+            return
+        t, frame = res
         self.current_frame = frame
+        self.current_ms = int(round(t * 1000))   # 実際に表示しているフレームの時刻
         self._update_preview()
-        total = self.frame_count / self.fps if self.fps else 0
         self.time_label.setText(
-            f"{format_time(index / self.fps)} / {format_time(total)}")
+            f"{format_time(self.current_ms / 1000)} / {format_time(self.duration_ms / 1000)}")
 
     def _load_slider_frame(self):
         self.show_frame(self.slider.value())
@@ -730,12 +951,33 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._update_preview()
 
+    def _go(self, ms: int):
+        """時刻 ms へ移動してすぐ表示する（キー操作・ダブルクリック用）"""
+        ms = max(0, min(self.duration_ms, int(ms)))
+        self.seek_timer.stop()
+        self.slider.blockSignals(True)
+        self.slider.setValue(ms)
+        self.slider.blockSignals(False)
+        self.show_frame(ms)
+
     def step_frames(self, n: int):
-        if self.cap is not None:
-            self.slider.setValue(self.slider.value() + n)
+        """前後のフレームへ移動（VFR動画でも、実際に記録されている次／前のフレームへ）"""
+        if self.reader is None or self.current_frame is None:
+            return
+        self.seek_timer.stop()
+        self.show_frame(self.slider.value())      # 表示と内部状態をそろえる
+        if n > 0:
+            t = self.reader.next_time()
+            if t is not None:
+                self._go(round(t * 1000))
+        else:
+            res = self.reader.frame_at(max(0.0, self.current_ms / 1000 - 0.004))
+            if res is not None:
+                self._go(round(res[0] * 1000))
 
     def step_seconds(self, sec: float):
-        self.step_frames(int(round(sec * self.fps)))
+        if self.reader is not None:
+            self._go(self.slider.value() + round(sec * 1000))
 
     # ---------------- 自動検出 ----------------
     def start_detection(self):
@@ -762,7 +1004,10 @@ class MainWindow(QMainWindow):
             interval_sec=self.interval_spin.value(),
             stable_sec=self.stable_spin.value(),
             exclude=tuple(self.preview.regions),
+            pick=self.pick_cb.currentData(),
+            margin_sec=self.margin_spin.value(),
         )
+        self._save_detect_settings()
         self.detect_thread = DetectThread(str(self.video_path), params, self)
         self.detect_thread.found.connect(self._on_detected)
         self.detect_thread.progress.connect(self.progress.setValue)
@@ -778,9 +1023,29 @@ class MainWindow(QMainWindow):
         if self.detect_thread is not None:
             self.detect_thread.requestInterruption()
 
-    def _on_detected(self, index: int, frame):
-        self.add_frame(frame, index, auto=True)
+    def _on_detected(self, t: float, frame):
+        self.add_frame(frame, int(round(t * 1000)), auto=True)
         self.detect_found += 1
+
+    def _load_detect_settings(self):
+        q = QSettings("slide_capture", "slide_capture")
+        try:
+            self.ratio_spin.setValue(float(q.value("detect/ratio", self.ratio_spin.value())))
+            self.interval_spin.setValue(float(q.value("detect/interval", self.interval_spin.value())))
+            self.stable_spin.setValue(float(q.value("detect/stable", self.stable_spin.value())))
+            self.margin_spin.setValue(float(q.value("detect/margin", self.margin_spin.value())))
+            idx = self.pick_cb.findData(str(q.value("detect/pick", "before")))
+            self.pick_cb.setCurrentIndex(max(0, idx))
+        except (TypeError, ValueError):
+            pass
+
+    def _save_detect_settings(self):
+        q = QSettings("slide_capture", "slide_capture")
+        q.setValue("detect/ratio", self.ratio_spin.value())
+        q.setValue("detect/interval", self.interval_spin.value())
+        q.setValue("detect/stable", self.stable_spin.value())
+        q.setValue("detect/margin", self.margin_spin.value())
+        q.setValue("detect/pick", self.pick_cb.currentData())
 
     def _on_detection_finished(self):
         stopped = self.detect_thread.isInterruptionRequested()
@@ -796,7 +1061,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(on)
         self.open_btn.setEnabled(not on)
         for wdg in (self.ratio_spin, self.interval_spin, self.stable_spin,
-                    self.clear_region_btn):
+                    self.pick_cb, self.margin_spin, self.clear_region_btn):
             wdg.setEnabled(not on)
         if on:
             self.region_btn.setChecked(False)
@@ -813,9 +1078,9 @@ class MainWindow(QMainWindow):
     # ---------------- 選択リスト ----------------
     def add_current_frame(self):
         if self.current_frame is not None:
-            self.add_frame(self.current_frame, self.current_index, auto=False)
+            self.add_frame(self.current_frame, self.current_ms, auto=False)
 
-    def add_frame(self, frame, index: int, auto: bool):
+    def add_frame(self, frame, ms: int, auto: bool):
         ok, buf = cv2.imencode(".png", frame)
         if not ok:
             return
@@ -825,17 +1090,17 @@ class MainWindow(QMainWindow):
 
         thumb = QPixmap.fromImage(bgr_to_qimage(frame)).scaled(
             192, 108, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label = format_time(index / self.fps) + ("  （自動）" if auto else "")
+        label = format_time(ms / 1000) + ("  （自動）" if auto else "")
         item = QListWidgetItem(QIcon(thumb), label)
         item.setData(ROLE_ID, cid)
-        item.setData(ROLE_FRAME, index)
+        item.setData(ROLE_TIME, ms)
         item.setData(ROLE_AUTO, auto)
 
         if auto:
             # 自動候補は時刻順の位置に差し込む
             row = self.list.count()
             for r in range(self.list.count()):
-                if (self.list.item(r).data(ROLE_FRAME) or 0) > index:
+                if (self.list.item(r).data(ROLE_TIME) or 0) > ms:
                     row = r
                     break
             self.list.insertItem(row, item)
@@ -845,6 +1110,32 @@ class MainWindow(QMainWindow):
             self.list.scrollToBottom()
         self._update_count()
 
+    def _set_item_frame(self, item: QListWidgetItem, frame, ms: int, label_suffix: str):
+        ok, buf = cv2.imencode(".png", frame)
+        if not ok:
+            return False
+        self.captures[item.data(ROLE_ID)] = buf.tobytes()
+        thumb = QPixmap.fromImage(bgr_to_qimage(frame)).scaled(
+            192, 108, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        item.setIcon(QIcon(thumb))
+        item.setText(format_time(ms / 1000) + label_suffix)
+        item.setData(ROLE_TIME, ms)
+        return True
+
+    def replace_selected(self):
+        """一覧で選択中の項目（1件）を、表示中のフレームで置き換える"""
+        items = self.list.selectedItems()
+        if self.current_frame is None or not items:
+            return
+        if len(items) > 1:
+            QMessageBox.information(self, "置き換え", "置き換える項目を1つだけ選択してください。")
+            return
+        item = items[0]
+        suffix = "  （修正）"
+        if self._set_item_frame(item, self.current_frame, self.current_ms, suffix):
+            self.statusBar().showMessage(
+                f"{format_time(self.current_ms / 1000)} のフレームで置き換えました", 5000)
+
     def delete_selected(self):
         for item in self.list.selectedItems():
             self.captures.pop(item.data(ROLE_ID), None)
@@ -853,9 +1144,10 @@ class MainWindow(QMainWindow):
 
     def _jump_to_item(self, item: QListWidgetItem):
         """一覧の項目をダブルクリックすると、その時刻へ移動する"""
-        idx = item.data(ROLE_FRAME)
-        if idx is not None and self.cap is not None:
-            self.slider.setValue(int(idx))
+        ms = item.data(ROLE_TIME)
+        if ms is not None and self.reader is not None:
+            self.seek_timer.stop()
+            self._go(int(ms))
 
     def _update_count(self):
         self.count_label.setText(f"選択済み: {self.list.count()} 枚")
@@ -927,12 +1219,52 @@ class MainWindow(QMainWindow):
         """一覧の順に PDF を書き出す（設定を省略すると既定値）"""
         write_pdf(path, self._ordered_pngs(), st or ExportSettings())
 
+    # ---------------- ドラッグ＆ドロップ ----------------
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".ts"}
+
+    def _dropped_path(self, mime):
+        """ドロップされたものが動画ファイル1つならそのパス、そうでなければ None"""
+        if not mime.hasUrls():
+            return None
+        files = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+        if len(files) != 1:
+            return None
+        return files[0] if Path(files[0]).suffix.lower() in self.VIDEO_EXTS else None
+
+    def dragEnterEvent(self, event):
+        if self._dropped_path(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        path = self._dropped_path(event.mimeData())
+        if path:
+            event.acceptProposedAction()
+            # ドロップ処理の中でダイアログを出すとドラッグ元のアプリが固まることがあるので、少し後で開く
+            QTimer.singleShot(0, lambda: self.load_video(path))
+        else:
+            event.ignore()
+
+    def eventFilter(self, obj, event):
+        # 一覧の上に動画ファイルを落とした場合も開く（一覧の並び替えのドラッグはそのまま）
+        if obj is self.list.viewport() and event.type() in (
+                QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            if self._dropped_path(event.mimeData()):
+                {QEvent.DragEnter: self.dragEnterEvent, QEvent.DragMove: self.dragMoveEvent,
+                 QEvent.Drop: self.dropEvent}[event.type()](event)
+                return True
+        return super().eventFilter(obj, event)
+
     def closeEvent(self, event):
         if self.detect_thread is not None:
             self.detect_thread.requestInterruption()
             self.detect_thread.wait()
-        if self.cap is not None:
-            self.cap.release()
+        if self.reader is not None:
+            self.reader.close()
         super().closeEvent(event)
 
 

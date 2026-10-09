@@ -38,6 +38,8 @@ a = Analysis(
 DROP_BINARIES = (
     "Qt6Qml", "Qt6Quick", "Qt6Pdf", "Qt6VirtualKeyboard", "Qt6Network",
     "qtvirtualkeyboard", "qpdf", "opengl32sw", "qgtk3", "libgtk-3", "libgdk-3",
+    # 動画の読み込みは PyAV で行うので、OpenCV の FFmpeg プラグイン（Windows）は不要
+    "opencv_videoio_ffmpeg",
 )
 a.binaries = [b for b in a.binaries
               if not any(k.lower() in os.path.basename(b[0]).lower() for k in DROP_BINARIES)]
